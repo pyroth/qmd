@@ -925,10 +925,15 @@ fn handle_vsearch(
     Ok(())
 }
 
-/// Handle embed command.
+/// Handle embed command with improved progress display.
 fn handle_embed(force: bool, model_path: Option<&str>) -> Result<()> {
-    use qmd::llm::EmbeddingEngine;
+    use qmd::llm::{
+        CHUNK_OVERLAP_TOKENS, CHUNK_SIZE_TOKENS, Cursor, EmbeddingEngine, Progress,
+        chunk_document_by_tokens, format_doc_for_embedding, format_eta, render_progress_bar,
+    };
+    use std::io::Write;
     use std::path::PathBuf;
+    use std::time::Instant;
 
     let store = Store::new()?;
 
@@ -945,11 +950,6 @@ fn handle_embed(force: bool, model_path: Option<&str>) -> Result<()> {
         println!("{} All documents already have embeddings.", "✓".green());
         return Ok(());
     }
-
-    println!(
-        "{}",
-        format!("Generating embeddings for {} documents...", pending.len()).bold()
-    );
 
     // Load embedding model
     let mut engine = if let Some(path) = model_path {
@@ -968,39 +968,207 @@ fn handle_embed(force: bool, model_path: Option<&str>) -> Result<()> {
         std::process::exit(1);
     };
 
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut success = 0;
-    let mut failed = 0;
+    // Prepare chunks using token-based chunking
+    eprintln!("Chunking {} documents by token count...", pending.len());
 
-    // Ensure vector table exists
-    store.ensure_vector_table(768)?; // Common embedding dimension
+    #[allow(dead_code)]
+    struct ChunkItem {
+        hash: String,
+        title: String,
+        text: String,
+        seq: usize,
+        pos: usize,
+        tokens: usize, // Kept for future logging/debugging
+        bytes: usize,
+        display_name: String,
+    }
 
-    for (i, (hash, path, content)) in pending.iter().enumerate() {
-        print!("\r  [{}/{}] Processing {}...", i + 1, pending.len(), path);
+    let mut all_chunks: Vec<ChunkItem> = Vec::new();
+    let mut multi_chunk_docs = 0usize;
 
-        match engine.embed(content) {
-            Ok(result) => {
-                store.insert_embedding(hash, 0, 0, &result.embedding, &result.model, &now)?;
-                success += 1;
+    for (hash, path, content) in &pending {
+        if content.is_empty() {
+            continue;
+        }
+
+        let title = Store::extract_title(content);
+
+        // Use token-based chunking for accuracy
+        match chunk_document_by_tokens(&engine, content, CHUNK_SIZE_TOKENS, CHUNK_OVERLAP_TOKENS) {
+            Ok(chunks) => {
+                if chunks.len() > 1 {
+                    multi_chunk_docs += 1;
+                }
+                for (seq, chunk) in chunks.into_iter().enumerate() {
+                    all_chunks.push(ChunkItem {
+                        hash: hash.clone(),
+                        title: title.clone(),
+                        text: chunk.text,
+                        seq,
+                        pos: chunk.pos,
+                        tokens: chunk.tokens,
+                        bytes: chunk.bytes,
+                        display_name: path.clone(),
+                    });
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "\n  {} Failed to embed {}: {}",
-                    "Warning:".yellow(),
-                    path,
-                    e
-                );
-                failed += 1;
+            Err(_) => {
+                // Fallback: treat entire document as single chunk
+                all_chunks.push(ChunkItem {
+                    hash: hash.clone(),
+                    title: title.clone(),
+                    text: content.clone(),
+                    seq: 0,
+                    pos: 0,
+                    tokens: content.len() / 4, // Estimate
+                    bytes: content.len(),
+                    display_name: path.clone(),
+                });
             }
         }
     }
 
+    if all_chunks.is_empty() {
+        println!("{} No non-empty documents to embed.", "✓".green());
+        return Ok(());
+    }
+
+    let total_bytes: usize = all_chunks.iter().map(|c| c.bytes).sum();
+    let total_chunks = all_chunks.len();
+    let total_docs = pending.len();
+
     println!(
-        "\n{} Embedded {} documents ({} failed)",
-        "✓".green(),
-        success,
-        failed
+        "{} {} {}",
+        "Embedding".bold(),
+        format!("{total_docs} documents").bold(),
+        format!("({total_chunks} chunks, {})", format_bytes(total_bytes)).dimmed()
     );
+    if multi_chunk_docs > 0 {
+        println!(
+            "{}",
+            format!("{multi_chunk_docs} documents split into multiple chunks").dimmed()
+        );
+    }
+
+    // Ensure vector table exists with first embedding
+    let progress = Progress::new();
+    progress.indeterminate();
+
+    let first_chunk = &all_chunks[0];
+    let first_text = format_doc_for_embedding(&first_chunk.text, Some(&first_chunk.title));
+    let first_result = engine.embed(&first_text)?;
+    let dims = first_result.embedding.len();
+    store.ensure_vector_table(dims)?;
+
+    // Hide cursor during embedding
+    Cursor::hide();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let start_time = Instant::now();
+    let mut chunks_embedded = 0usize;
+    let mut errors = 0usize;
+    let mut bytes_processed = 0usize;
+
+    // Insert first chunk result
+    store.insert_embedding(
+        &first_chunk.hash,
+        first_chunk.seq,
+        first_chunk.pos,
+        &first_result.embedding,
+        &first_result.model,
+        &now,
+    )?;
+    chunks_embedded += 1;
+    bytes_processed += first_chunk.bytes;
+
+    // Process remaining chunks
+    for chunk in all_chunks.iter().skip(1) {
+        let formatted = format_doc_for_embedding(&chunk.text, Some(&chunk.title));
+
+        match engine.embed(&formatted) {
+            Ok(result) => {
+                store.insert_embedding(
+                    &chunk.hash,
+                    chunk.seq,
+                    chunk.pos,
+                    &result.embedding,
+                    &result.model,
+                    &now,
+                )?;
+                chunks_embedded += 1;
+            }
+            Err(e) => {
+                errors += 1;
+                eprintln!(
+                    "\n{} Error embedding \"{}\" chunk {}: {}",
+                    "⚠".yellow(),
+                    chunk.display_name,
+                    chunk.seq,
+                    e
+                );
+            }
+        }
+        bytes_processed += chunk.bytes;
+
+        // Update progress
+        let percent = (bytes_processed as f64 / total_bytes as f64) * 100.0;
+        progress.set(percent);
+
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let bytes_per_sec = bytes_processed as f64 / elapsed;
+        let remaining_bytes = total_bytes.saturating_sub(bytes_processed);
+        let eta_sec = remaining_bytes as f64 / bytes_per_sec;
+
+        let bar = render_progress_bar(percent, 20);
+        let percent_str = format!("{:3.0}%", percent);
+        let throughput = format!("{}/s", format_bytes(bytes_per_sec as usize));
+        let eta = if elapsed > 2.0 {
+            format_eta(eta_sec)
+        } else {
+            "...".to_string()
+        };
+        let err_str = if errors > 0 {
+            format!(" {} err", errors).yellow().to_string()
+        } else {
+            String::new()
+        };
+
+        eprint!(
+            "\r{} {} {}/{}{} {} ETA {}   ",
+            bar.cyan(),
+            percent_str.bold(),
+            chunks_embedded,
+            total_chunks,
+            err_str,
+            throughput.dimmed(),
+            eta.dimmed()
+        );
+        std::io::stderr().flush().ok();
+    }
+
+    progress.clear();
+    Cursor::show();
+
+    let total_time_sec = start_time.elapsed().as_secs_f64();
+    let avg_throughput = format_bytes((total_bytes as f64 / total_time_sec) as usize);
+
+    println!(
+        "\r{} {}                                    ",
+        render_progress_bar(100.0, 20).green(),
+        "100%".bold()
+    );
+    println!(
+        "\n{} Embedded {} chunks from {} documents in {} ({})",
+        "✓".green(),
+        chunks_embedded.to_string().bold(),
+        total_docs.to_string().bold(),
+        format_eta(total_time_sec).bold(),
+        format!("{avg_throughput}/s").dimmed()
+    );
+    if errors > 0 {
+        println!("{} {} chunks failed", "⚠".yellow(), errors);
+    }
+
     Ok(())
 }
 

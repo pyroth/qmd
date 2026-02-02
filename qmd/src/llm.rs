@@ -6,9 +6,11 @@
 //! - Query expansion
 //! - Reranking
 //! - Automatic model download from `HuggingFace`
+//! - Session management with lifecycle control
+//! - Batch embedding with parallel processing
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -55,6 +57,98 @@ pub const CHUNK_SIZE_CHARS: usize = 3200;
 
 /// Overlap between chunks in characters
 pub const CHUNK_OVERLAP_CHARS: usize = 480;
+
+/// Terminal progress bar with OSC 9;4 escape sequence support.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Progress {
+    enabled: bool,
+}
+
+impl Progress {
+    /// Create a new progress indicator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            enabled: std::io::stderr().is_terminal(),
+        }
+    }
+
+    /// Set progress percentage (0-100).
+    pub fn set(&self, percent: f64) {
+        if self.enabled {
+            eprint!("\x1b]9;4;1;{}\x07", percent.round() as u8);
+        }
+    }
+
+    /// Clear progress indicator.
+    pub fn clear(&self) {
+        if self.enabled {
+            eprint!("\x1b]9;4;0\x07");
+        }
+    }
+
+    /// Set indeterminate progress.
+    pub fn indeterminate(&self) {
+        if self.enabled {
+            eprint!("\x1b]9;4;3\x07");
+        }
+    }
+
+    /// Set error state.
+    pub fn error(&self) {
+        if self.enabled {
+            eprint!("\x1b]9;4;2\x07");
+        }
+    }
+}
+
+/// Cursor visibility control.
+#[derive(Debug, Clone, Copy)]
+pub struct Cursor;
+
+impl Cursor {
+    /// Hide cursor.
+    pub fn hide() {
+        if std::io::stderr().is_terminal() {
+            eprint!("\x1b[?25l");
+        }
+    }
+
+    /// Show cursor.
+    pub fn show() {
+        if std::io::stderr().is_terminal() {
+            eprint!("\x1b[?25h");
+        }
+    }
+}
+
+/// Format ETA in human-readable form.
+#[must_use]
+pub fn format_eta(seconds: f64) -> String {
+    if seconds < 60.0 {
+        format!("{}s", seconds.round() as u64)
+    } else if seconds < 3600.0 {
+        format!(
+            "{}m {}s",
+            (seconds / 60.0) as u64,
+            (seconds % 60.0).round() as u64
+        )
+    } else {
+        format!(
+            "{}h {}m",
+            (seconds / 3600.0) as u64,
+            ((seconds % 3600.0) / 60.0).round() as u64
+        )
+    }
+}
+
+/// Render a progress bar string.
+#[must_use]
+pub fn render_progress_bar(percent: f64, width: usize) -> String {
+    let filled = ((percent / 100.0) * width as f64).round() as usize;
+    let empty = width.saturating_sub(filled);
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
 
 /// Embedding engine for generating document vectors.
 pub struct EmbeddingEngine {
@@ -222,6 +316,61 @@ impl EmbeddingEngine {
     pub const fn dimensions(&self) -> Option<usize> {
         self.dimensions
     }
+
+    /// Count tokens in text using the model's tokenizer.
+    ///
+    /// # Errors
+    /// Returns an error if tokenization fails.
+    pub fn count_tokens(&self, text: &str) -> Result<usize> {
+        let tokens = self
+            .model
+            .str_to_token(text, AddBos::Never)
+            .context("Failed to tokenize")?;
+        Ok(tokens.len())
+    }
+
+    /// Tokenize text and return token count.
+    /// Returns (token_ids, count) for advanced use cases.
+    ///
+    /// # Errors
+    /// Returns an error if tokenization fails.
+    pub fn tokenize(&self, text: &str) -> Result<Vec<i32>> {
+        let tokens = self
+            .model
+            .str_to_token(text, AddBos::Never)
+            .context("Failed to tokenize")?;
+        Ok(tokens.iter().map(|t| t.0).collect())
+    }
+
+    /// Embed multiple documents efficiently with progress callback.
+    ///
+    /// This method processes documents one by one but provides progress updates.
+    /// Use this for large batch operations like indexing.
+    ///
+    /// # Arguments
+    /// * `items` - Documents to embed with their metadata
+    /// * `on_progress` - Callback for progress updates (current, total)
+    ///
+    /// # Errors
+    /// Returns an error if embedding fails for any document.
+    pub fn embed_batch_with_progress<F>(
+        &mut self,
+        items: &[(String, Option<String>)], // (text, title)
+        mut on_progress: F,
+    ) -> Vec<Result<EmbeddingResult>>
+    where
+        F: FnMut(usize, usize),
+    {
+        let total = items.len();
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, (text, title))| {
+                on_progress(i, total);
+                self.embed_document(text, title.as_deref())
+            })
+            .collect()
+    }
 }
 
 /// Format a document for embedding using nomic-style format.
@@ -281,7 +430,134 @@ pub fn list_cached_models() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Chunk a document into smaller pieces for embedding.
+/// A document chunk with token information.
+#[derive(Debug, Clone)]
+pub struct TokenChunk {
+    /// The text content of the chunk
+    pub text: String,
+    /// Character position in original document
+    pub pos: usize,
+    /// Token count for this chunk
+    pub tokens: usize,
+    /// Byte size of the chunk
+    pub bytes: usize,
+}
+
+/// Chunk a document by token count using the model's tokenizer.
+///
+/// This provides more accurate chunking than character-based methods
+/// since different text can have very different token densities.
+///
+/// # Arguments
+/// * `engine` - The embedding engine (for tokenization)
+/// * `content` - The document content
+/// * `max_tokens` - Maximum tokens per chunk (default: 800)
+/// * `overlap_tokens` - Overlap between chunks (default: 120)
+///
+/// # Errors
+/// Returns an error if tokenization fails.
+pub fn chunk_document_by_tokens(
+    engine: &EmbeddingEngine,
+    content: &str,
+    max_tokens: usize,
+    overlap_tokens: usize,
+) -> Result<Vec<TokenChunk>> {
+    // Quick path for short documents
+    let total_tokens = engine.count_tokens(content)?;
+    if total_tokens <= max_tokens {
+        return Ok(vec![TokenChunk {
+            text: content.to_string(),
+            pos: 0,
+            tokens: total_tokens,
+            bytes: content.len(),
+        }]);
+    }
+
+    let mut chunks = Vec::new();
+    let paragraphs: Vec<&str> = content.split("\n\n").collect();
+    let mut current_chunk = String::new();
+    let mut current_tokens = 0usize;
+    let mut chunk_start_pos = 0usize;
+    let mut char_pos = 0usize;
+
+    for (para_idx, para) in paragraphs.iter().enumerate() {
+        let para_tokens = engine.count_tokens(para)?;
+        let para_with_sep = if para_idx > 0 {
+            format!("\n\n{para}")
+        } else {
+            (*para).to_string()
+        };
+        let sep_tokens = if para_idx > 0 { 2 } else { 0 }; // Approximate newlines
+
+        // If adding this paragraph exceeds limit, finalize current chunk
+        if current_tokens + para_tokens + sep_tokens > max_tokens && !current_chunk.is_empty() {
+            let chunk_bytes = current_chunk.len();
+            chunks.push(TokenChunk {
+                text: current_chunk.clone(),
+                pos: chunk_start_pos,
+                tokens: current_tokens,
+                bytes: chunk_bytes,
+            });
+
+            // Start new chunk with overlap (keep last part)
+            let overlap_text = get_overlap_text(&current_chunk, overlap_tokens, engine)?;
+            current_chunk = overlap_text;
+            current_tokens = engine.count_tokens(&current_chunk)?;
+            chunk_start_pos = char_pos.saturating_sub(current_chunk.len());
+        }
+
+        // Add paragraph to current chunk
+        if !current_chunk.is_empty() {
+            current_chunk.push_str("\n\n");
+        }
+        current_chunk.push_str(para);
+        current_tokens += para_tokens + sep_tokens;
+        char_pos += para_with_sep.len();
+    }
+
+    // Don't forget the last chunk
+    if !current_chunk.is_empty() {
+        chunks.push(TokenChunk {
+            text: current_chunk.clone(),
+            pos: chunk_start_pos,
+            tokens: current_tokens,
+            bytes: current_chunk.len(),
+        });
+    }
+
+    Ok(chunks)
+}
+
+/// Get overlap text from the end of a chunk.
+fn get_overlap_text(text: &str, target_tokens: usize, engine: &EmbeddingEngine) -> Result<String> {
+    // Start from 20% of the text and work forward until we hit target tokens
+    let start_frac = text.len() * 4 / 5;
+    let candidate = &text[start_frac..];
+
+    // Find a good break point (paragraph or sentence)
+    if let Some(pos) = candidate.find("\n\n") {
+        let overlap = &candidate[pos + 2..];
+        let tokens = engine.count_tokens(overlap)?;
+        if tokens <= target_tokens * 2 {
+            return Ok(overlap.to_string());
+        }
+    }
+
+    // Fall back to word boundary
+    let words: Vec<&str> = candidate.split_whitespace().collect();
+    let mut result = String::new();
+    for word in words.iter().rev().take(target_tokens / 2) {
+        if !result.is_empty() {
+            result = format!("{word} {result}");
+        } else {
+            result = (*word).to_string();
+        }
+    }
+
+    Ok(result)
+}
+
+/// Chunk a document into smaller pieces for embedding (character-based fallback).
 ///
 /// # Arguments
 /// * `content` - The document content
