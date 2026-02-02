@@ -23,8 +23,9 @@ pub mod store;
 pub use cli::{Cli, Commands};
 pub use error::{QmdError, Result};
 pub use llm::{
-    IndexHealth, PullResult, QueryType, Queryable, RerankDocument, RerankResult, RrfResult,
-    SnippetResult, expand_query_simple, extract_snippet, pull_model, pull_models,
+    BatchRerankResult, GenerationEngine, GenerationResult, IndexHealth, PullResult, QueryType,
+    Queryable, RerankDocument, RerankEngine, RerankResult, RrfResult, SnippetResult,
+    expand_query_simple, extract_snippet, hybrid_search_rrf, pull_model, pull_models,
     reciprocal_rank_fusion, resolve_model,
 };
 pub use store::{Store, find_similar_files, match_files_by_glob};

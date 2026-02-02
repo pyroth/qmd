@@ -38,15 +38,17 @@ pub struct DocumentResult {
     pub body: Option<String>,
 }
 
-/// Search result extends `DocumentResult` with score.
+/// Search result with score.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
-    /// The document.
+    /// The document result.
     pub doc: DocumentResult,
-    /// Relevance score (0-1).
+    /// Relevance score.
     pub score: f64,
-    /// Search source.
+    /// Source of the result.
     pub source: SearchSource,
+    /// Chunk position for vector search results (0-indexed).
+    pub chunk_pos: Option<usize>,
 }
 
 /// Search source type.
@@ -460,6 +462,7 @@ impl Store {
                     },
                     score: -score, // BM25 returns negative scores, higher is better.
                     source: SearchSource::Fts,
+                    chunk_pos: None,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
@@ -490,6 +493,7 @@ impl Store {
                     },
                     score: -score,
                     source: SearchSource::Fts,
+                    chunk_pos: None,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
@@ -901,6 +905,7 @@ impl Store {
                     },
                     score: f64::from(similarity),
                     source: SearchSource::Vec,
+                    chunk_pos: Some(0), // First chunk (chunk position tracking)
                 });
             }
         }

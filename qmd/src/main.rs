@@ -81,6 +81,37 @@ fn main() -> Result<()> {
         Commands::Embed { force, model } => handle_embed(force, model.as_deref()),
         Commands::Models(cmd) => handle_models(cmd),
         Commands::Db(cmd) => handle_db(cmd),
+        Commands::Qsearch {
+            query,
+            collection,
+            limit,
+            full,
+            no_expand,
+            no_rerank,
+            format,
+        } => handle_qsearch(
+            &query,
+            collection.as_deref(),
+            limit,
+            full,
+            no_expand,
+            no_rerank,
+            &format,
+        ),
+        Commands::Expand { query, lexical } => handle_expand(&query, lexical),
+        Commands::Rerank {
+            query,
+            files,
+            limit,
+            format,
+        } => handle_rerank(&query, &files, limit, &format),
+        Commands::Ask {
+            question,
+            collection,
+            limit,
+            max_tokens,
+        } => handle_ask(&question, collection.as_deref(), limit, max_tokens),
+        Commands::Index { name } => handle_index(name.as_deref()),
     }
 }
 
@@ -698,6 +729,9 @@ fn handle_update(pull: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Load YAML config to get update commands
+    let yaml_collections = yaml_list_collections().unwrap_or_default();
+
     println!(
         "{}\n",
         format!("Updating {} collection(s)...", collections.len()).bold()
@@ -710,6 +744,49 @@ fn handle_update(pull: bool) -> Result<()> {
             coll.name.bold(),
             format!("({})", coll.glob_pattern).dimmed()
         );
+
+        // Check for custom update command in YAML config
+        if let Some(yaml_coll) = yaml_collections.iter().find(|c| c.name == coll.name) {
+            if let Some(ref update_cmd) = yaml_coll.update {
+                println!("    Running update command: {}", update_cmd.dimmed());
+                let output = if cfg!(target_os = "windows") {
+                    std::process::Command::new("cmd")
+                        .args(["/C", update_cmd])
+                        .current_dir(&coll.pwd)
+                        .output()
+                } else {
+                    std::process::Command::new("sh")
+                        .args(["-c", update_cmd])
+                        .current_dir(&coll.pwd)
+                        .output()
+                };
+
+                match output {
+                    Ok(o) if o.status.success() => {
+                        let stdout = String::from_utf8_lossy(&o.stdout);
+                        if !stdout.trim().is_empty() {
+                            for line in stdout.lines().take(10) {
+                                println!("    {line}");
+                            }
+                        }
+                    }
+                    Ok(o) => {
+                        eprintln!("    {} update command failed", "Warning:".yellow());
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        for line in stderr.lines().take(5) {
+                            eprintln!("    {line}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "    {} Could not run update command: {}",
+                            "Warning:".yellow(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
 
         // Git pull if requested.
         if pull {
@@ -1044,6 +1121,412 @@ fn handle_db(cmd: DbCommands) -> Result<()> {
         DbCommands::ClearCache => {
             let cleared = store.clear_cache()?;
             println!("{} Cleared {} cached entries", "✓".green(), cleared);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle qsearch (hybrid search with query expansion and reranking).
+fn handle_qsearch(
+    query: &str,
+    collection: Option<&str>,
+    limit: usize,
+    full: bool,
+    no_expand: bool,
+    no_rerank: bool,
+    format: &OutputFormat,
+) -> Result<()> {
+    use qmd::llm::{EmbeddingEngine, GenerationEngine, RerankDocument, RerankEngine};
+
+    let store = Store::new()?;
+
+    // Step 1: Query expansion (optional)
+    let queries = if no_expand || !GenerationEngine::is_available() {
+        vec![qmd::Queryable::lex(query), qmd::Queryable::vec(query)]
+    } else {
+        println!("Expanding query...");
+        match GenerationEngine::load_default() {
+            Ok(engine) => match engine.expand_query(query, true) {
+                Ok(q) => q,
+                Err(_) => qmd::expand_query_simple(query),
+            },
+            Err(_) => qmd::expand_query_simple(query),
+        }
+    };
+
+    // Step 2: Run searches based on query types
+    let mut fts_results: Vec<(String, String, String, String)> = Vec::new();
+    let mut vec_results: Vec<(String, String, String, String)> = Vec::new();
+
+    for q in &queries {
+        match q.query_type {
+            qmd::QueryType::Lex => {
+                if let Ok(results) = store.search_fts(&q.text, limit * 2, collection) {
+                    for r in results {
+                        let body = r.doc.body.clone().unwrap_or_default();
+                        fts_results.push((
+                            r.doc.filepath.clone(),
+                            r.doc.display_path.clone(),
+                            r.doc.title.clone(),
+                            body,
+                        ));
+                    }
+                }
+            }
+            qmd::QueryType::Vec | qmd::QueryType::Hyde => {
+                if let Ok(mut engine) = EmbeddingEngine::load_default() {
+                    if let Ok(query_result) = engine.embed_query(&q.text) {
+                        if let Ok(results) =
+                            store.search_vec(&query_result.embedding, limit * 2, collection)
+                        {
+                            for r in results {
+                                let body = store
+                                    .get_document(&r.doc.collection_name, &r.doc.path)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|d| d.body)
+                                    .unwrap_or_default();
+                                vec_results.push((
+                                    r.doc.filepath.clone(),
+                                    r.doc.display_path.clone(),
+                                    r.doc.title.clone(),
+                                    body,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 3: RRF fusion
+    let mut rrf_results = qmd::hybrid_search_rrf(fts_results, vec_results, 60);
+
+    // Step 4: Rerank (optional)
+    if !no_rerank && RerankEngine::is_available() && !rrf_results.is_empty() {
+        println!("Reranking {} results...", rrf_results.len().min(limit * 2));
+        if let Ok(mut reranker) = RerankEngine::load_default() {
+            let docs: Vec<RerankDocument> = rrf_results
+                .iter()
+                .take(limit * 2)
+                .map(|r| RerankDocument {
+                    file: r.file.clone(),
+                    text: r.body.clone(),
+                    title: Some(r.title.clone()),
+                })
+                .collect();
+
+            if let Ok(reranked) = reranker.rerank(query, &docs) {
+                // Reorder based on rerank scores
+                let mut reordered = Vec::new();
+                for rr in reranked.results {
+                    if let Some(orig) = rrf_results.iter().find(|r| r.file == rr.file) {
+                        reordered.push(orig.clone());
+                    }
+                }
+                rrf_results = reordered;
+            }
+        }
+    }
+
+    // Step 5: Format and output
+    rrf_results.truncate(limit);
+
+    if rrf_results.is_empty() {
+        println!("{}", "No results found.".dimmed());
+        return Ok(());
+    }
+
+    // Convert to SearchResult for formatting
+    let search_results: Vec<qmd::store::SearchResult> = rrf_results
+        .iter()
+        .map(|r| {
+            let parts: Vec<&str> = r
+                .file
+                .strip_prefix("qmd://")
+                .unwrap_or(&r.file)
+                .splitn(2, '/')
+                .collect();
+            let (collection_name, path) = if parts.len() == 2 {
+                (parts[0].to_string(), parts[1].to_string())
+            } else {
+                (String::new(), r.file.clone())
+            };
+
+            qmd::store::SearchResult {
+                doc: qmd::store::DocumentResult {
+                    filepath: r.file.clone(),
+                    display_path: r.display_path.clone(),
+                    title: r.title.clone(),
+                    context: None,
+                    hash: String::new(),
+                    docid: String::new(),
+                    collection_name,
+                    path,
+                    modified_at: String::new(),
+                    body_length: r.body.len(),
+                    body: if full { Some(r.body.clone()) } else { None },
+                },
+                score: r.score,
+                source: qmd::store::SearchSource::Fts,
+                chunk_pos: None,
+            }
+        })
+        .collect();
+
+    format_search_results(&search_results, format, full);
+    Ok(())
+}
+
+/// Handle expand command.
+fn handle_expand(query: &str, include_lexical: bool) -> Result<()> {
+    use qmd::llm::GenerationEngine;
+
+    println!("{}\n", "Query Expansion".bold());
+    println!("Original: {query}\n");
+
+    let queries = if GenerationEngine::is_available() {
+        match GenerationEngine::load_default() {
+            Ok(engine) => match engine.expand_query(query, include_lexical) {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("{} LLM expansion failed: {}", "Warning:".yellow(), e);
+                    qmd::expand_query_simple(query)
+                }
+            },
+            Err(e) => {
+                eprintln!("{} Could not load model: {}", "Warning:".yellow(), e);
+                qmd::expand_query_simple(query)
+            }
+        }
+    } else {
+        println!(
+            "{}",
+            "Generation model not available, using simple expansion.".dimmed()
+        );
+        qmd::expand_query_simple(query)
+    };
+
+    println!("{}", "Expanded queries:".cyan());
+    for q in &queries {
+        let type_str = match q.query_type {
+            qmd::QueryType::Lex => "lex".green(),
+            qmd::QueryType::Vec => "vec".blue(),
+            qmd::QueryType::Hyde => "hyde".magenta(),
+        };
+        println!("  {}: {}", type_str, q.text);
+    }
+
+    Ok(())
+}
+
+/// Handle rerank command.
+fn handle_rerank(query: &str, files: &str, limit: usize, format: &OutputFormat) -> Result<()> {
+    use qmd::llm::{RerankDocument, RerankEngine};
+
+    let store = Store::new()?;
+
+    // Parse file list
+    let file_list: Vec<&str> = files
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if file_list.is_empty() {
+        eprintln!("{} No files specified", "Error:".red());
+        std::process::exit(1);
+    }
+
+    // Load documents
+    let mut docs: Vec<RerankDocument> = Vec::new();
+    for file in &file_list {
+        let (collection, path) = if is_virtual_path(file) {
+            parse_virtual_path(file).unwrap_or_else(|| {
+                eprintln!("{} Invalid path: {}", "Warning:".yellow(), file);
+                (String::new(), file.to_string())
+            })
+        } else {
+            let parts: Vec<&str> = file.splitn(2, '/').collect();
+            if parts.len() == 2 {
+                (parts[0].to_string(), parts[1].to_string())
+            } else {
+                continue;
+            }
+        };
+
+        if let Ok(Some(doc)) = store.get_document(&collection, &path) {
+            docs.push(RerankDocument {
+                file: doc.filepath.clone(),
+                text: doc.body.unwrap_or_default(),
+                title: Some(doc.title),
+            });
+        }
+    }
+
+    if docs.is_empty() {
+        eprintln!("{} No valid documents found", "Error:".red());
+        std::process::exit(1);
+    }
+
+    println!("Reranking {} documents...", docs.len());
+
+    let mut engine = RerankEngine::load_default().map_err(|e| {
+        eprintln!("{} Could not load rerank model: {}", "Error:".red(), e);
+        eprintln!("Run 'qmd models pull' to download required models.");
+        std::process::exit(1);
+    })?;
+
+    let result = engine.rerank(query, &docs)?;
+
+    // Output results
+    match format {
+        OutputFormat::Json => {
+            let output: Vec<serde_json::Value> = result
+                .results
+                .iter()
+                .take(limit)
+                .map(|r| {
+                    serde_json::json!({
+                        "file": r.file,
+                        "score": r.score,
+                        "rank": r.index + 1,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        _ => {
+            println!("\n{}", "Reranked Results:".bold());
+            for (i, r) in result.results.iter().take(limit).enumerate() {
+                println!(
+                    "{}. {} {}",
+                    (i + 1).to_string().cyan(),
+                    format!("{:.4}", r.score).dimmed(),
+                    r.file.bold()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle ask command (question answering).
+fn handle_ask(
+    question: &str,
+    collection: Option<&str>,
+    limit: usize,
+    max_tokens: usize,
+) -> Result<()> {
+    use qmd::llm::{EmbeddingEngine, GenerationEngine};
+
+    let store = Store::new()?;
+
+    println!("{}", "Searching for relevant documents...".dimmed());
+
+    // Search for relevant documents using vector search
+    let context_docs = if let Ok(mut engine) = EmbeddingEngine::load_default() {
+        if let Ok(query_result) = engine.embed_query(question) {
+            store
+                .search_vec(&query_result.embedding, limit, collection)
+                .unwrap_or_default()
+        } else {
+            // Fallback to FTS
+            store
+                .search_fts(question, limit, collection)
+                .unwrap_or_default()
+        }
+    } else {
+        store
+            .search_fts(question, limit, collection)
+            .unwrap_or_default()
+    };
+
+    if context_docs.is_empty() {
+        println!("{}", "No relevant documents found.".yellow());
+        return Ok(());
+    }
+
+    // Build context from documents
+    let mut context = String::new();
+    for (i, result) in context_docs.iter().enumerate() {
+        let body = store
+            .get_document(&result.doc.collection_name, &result.doc.path)
+            .ok()
+            .flatten()
+            .and_then(|d| d.body)
+            .unwrap_or_default();
+
+        // Truncate each document to ~1000 chars
+        let truncated: String = body.chars().take(1000).collect();
+        context.push_str(&format!(
+            "\n--- Document {} ({}): ---\n{}\n",
+            i + 1,
+            result.doc.display_path,
+            truncated
+        ));
+    }
+
+    println!(
+        "Found {} relevant documents. Generating answer...\n",
+        context_docs.len()
+    );
+
+    // Generate answer
+    let gen_engine = GenerationEngine::load_default().map_err(|e| {
+        eprintln!("{} Could not load generation model: {}", "Error:".red(), e);
+        eprintln!("Run 'qmd models pull all' to download required models.");
+        std::process::exit(1);
+    })?;
+
+    let prompt = format!(
+        r#"Based on the following documents, answer the question concisely and accurately.
+
+Documents:
+{context}
+
+Question: {question}
+
+Answer:"#
+    );
+
+    let result = gen_engine.generate(&prompt, max_tokens)?;
+
+    println!("{}\n", "Answer:".green().bold());
+    println!("{}", result.text);
+
+    println!("\n{}", "Sources:".dimmed());
+    for result in &context_docs {
+        println!("  - {}", result.doc.display_path);
+    }
+
+    Ok(())
+}
+
+/// Handle index command (switch index).
+fn handle_index(name: Option<&str>) -> Result<()> {
+    use qmd::collections::set_config_index_name;
+
+    match name {
+        Some(index_name) => {
+            set_config_index_name(index_name);
+            let db_path = qmd::config::get_default_db_path(index_name)
+                .unwrap_or_else(|| std::path::PathBuf::from("unknown"));
+            println!("{} Switched to index: {}", "✓".green(), index_name.cyan());
+            println!("  Database: {}", db_path.display());
+        }
+        None => {
+            // Show current index
+            let default_path = qmd::config::get_default_db_path("index")
+                .unwrap_or_else(|| std::path::PathBuf::from("unknown"));
+            println!("{}", "Current Index".bold());
+            println!("  Name: {}", "index".cyan());
+            println!("  Path: {}", default_path.display());
+            println!("\n{}", "Usage:".dimmed());
+            println!("  qmd index <name>  - Switch to a different index");
         }
     }
 

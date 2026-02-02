@@ -157,6 +157,87 @@ pub enum Commands {
     /// Database maintenance commands.
     #[command(subcommand)]
     Db(DbCommands),
+
+    /// Hybrid search with query expansion, RRF fusion, and reranking.
+    Qsearch {
+        /// Search query.
+        query: String,
+
+        /// Restrict to a collection.
+        #[arg(short, long)]
+        collection: Option<String>,
+
+        /// Number of results.
+        #[arg(short = 'n', long, default_value = "10")]
+        limit: usize,
+
+        /// Show full document content.
+        #[arg(long)]
+        full: bool,
+
+        /// Skip query expansion.
+        #[arg(long)]
+        no_expand: bool,
+
+        /// Skip reranking.
+        #[arg(long)]
+        no_rerank: bool,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "cli")]
+        format: OutputFormat,
+    },
+
+    /// Expand a query using LLM.
+    Expand {
+        /// Query to expand.
+        query: String,
+
+        /// Include lexical (BM25) queries.
+        #[arg(long, default_value = "true")]
+        lexical: bool,
+    },
+
+    /// Rerank documents by relevance to a query.
+    Rerank {
+        /// Query for reranking.
+        query: String,
+
+        /// Comma-separated list of file paths to rerank.
+        files: String,
+
+        /// Number of top results to return.
+        #[arg(short = 'n', long, default_value = "10")]
+        limit: usize,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "cli")]
+        format: OutputFormat,
+    },
+
+    /// Ask a question and get an answer from relevant documents.
+    Ask {
+        /// Question to ask.
+        question: String,
+
+        /// Restrict to a collection.
+        #[arg(short, long)]
+        collection: Option<String>,
+
+        /// Number of context documents.
+        #[arg(short = 'n', long, default_value = "5")]
+        limit: usize,
+
+        /// Maximum tokens for answer.
+        #[arg(long, default_value = "500")]
+        max_tokens: usize,
+    },
+
+    /// Switch to a different index.
+    Index {
+        /// Index name (creates ~/.cache/qmd/{name}.sqlite).
+        name: Option<String>,
+    },
 }
 
 /// Model management commands.

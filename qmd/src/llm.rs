@@ -57,12 +57,21 @@ pub const CHUNK_SIZE_CHARS: usize = 3200;
 pub const CHUNK_OVERLAP_CHARS: usize = 480;
 
 /// Embedding engine for generating document vectors.
-#[derive(Debug)]
 pub struct EmbeddingEngine {
+    /// Llama backend instance
+    backend: LlamaBackend,
     /// The loaded LLM model
     model: Arc<LlamaModel>,
     /// Model dimensions (set after first embedding)
     dimensions: Option<usize>,
+}
+
+impl std::fmt::Debug for EmbeddingEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingEngine")
+            .field("dimensions", &self.dimensions)
+            .finish()
+    }
 }
 
 /// Result of an embedding operation.
@@ -100,6 +109,7 @@ impl EmbeddingEngine {
             .with_context(|| format!("Failed to load model from {}", model_path.display()))?;
 
         Ok(Self {
+            backend,
             model: Arc::new(model),
             dimensions: None,
         })
@@ -168,7 +178,7 @@ impl EmbeddingEngine {
 
         let mut ctx = self
             .model
-            .new_context(&LlamaBackend::init()?, ctx_params)
+            .new_context(&self.backend, ctx_params)
             .context("Failed to create context")?;
 
         // Tokenize input
@@ -919,6 +929,303 @@ impl IndexHealth {
             Some(messages.join("\n"))
         }
     }
+}
+
+/// Text generation engine using GGUF models.
+pub struct GenerationEngine {
+    /// Llama backend instance
+    backend: LlamaBackend,
+    /// The loaded LLM model
+    model: Arc<LlamaModel>,
+}
+
+impl std::fmt::Debug for GenerationEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenerationEngine").finish()
+    }
+}
+
+/// Result of a text generation operation.
+#[derive(Debug, Clone)]
+pub struct GenerationResult {
+    /// Generated text
+    pub text: String,
+    /// Model name used
+    pub model: String,
+    /// Whether generation completed
+    pub done: bool,
+}
+
+impl GenerationEngine {
+    /// Create a new generation engine with the specified model.
+    pub fn new(model_path: &Path) -> Result<Self> {
+        let backend = LlamaBackend::init()?;
+        let model_params = LlamaModelParams::default();
+
+        let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
+            .with_context(|| format!("Failed to load model from {}", model_path.display()))?;
+
+        Ok(Self {
+            backend,
+            model: Arc::new(model),
+        })
+    }
+
+    /// Load the default generation model.
+    pub fn load_default() -> Result<Self> {
+        let model_path = get_model_path(DEFAULT_GENERATE_MODEL)?;
+        Self::new(&model_path)
+    }
+
+    /// Check if generation model exists.
+    pub fn is_available() -> bool {
+        model_exists(DEFAULT_GENERATE_MODEL)
+    }
+
+    /// Generate text from a prompt using simple token-by-token generation.
+    pub fn generate(&self, prompt: &str, max_tokens: usize) -> Result<GenerationResult> {
+        use llama_cpp_2::sampling::LlamaSampler;
+
+        let ctx_params = LlamaContextParams::default().with_n_ctx(std::num::NonZero::new(4096));
+
+        let mut ctx = self
+            .model
+            .new_context(&self.backend, ctx_params)
+            .context("Failed to create context")?;
+
+        // Tokenize prompt
+        let tokens = self
+            .model
+            .str_to_token(prompt, AddBos::Always)
+            .context("Failed to tokenize prompt")?;
+
+        // Create batch and add prompt tokens
+        let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
+        for (i, token) in tokens.iter().enumerate() {
+            batch.add(*token, i as i32, &[0], i == tokens.len() - 1)?;
+        }
+
+        // Decode prompt
+        ctx.decode(&mut batch).context("Failed to decode prompt")?;
+
+        // Create sampler chain for generation
+        let mut sampler = LlamaSampler::chain_simple([
+            LlamaSampler::temp(0.7),
+            LlamaSampler::top_k(40),
+            LlamaSampler::top_p(0.9, 1),
+            LlamaSampler::dist(42),
+        ]);
+
+        // Generate tokens
+        let mut output_text = String::new();
+        let mut n_cur = tokens.len();
+
+        for _ in 0..max_tokens {
+            // Sample next token
+            let new_token = sampler.sample(&ctx, batch.n_tokens() - 1);
+
+            // Check for end of generation
+            if self.model.is_eog_token(new_token) {
+                break;
+            }
+
+            // Convert token to string
+            if let Ok(piece) = self
+                .model
+                .token_to_str(new_token, llama_cpp_2::model::Special::Tokenize)
+            {
+                output_text.push_str(&piece);
+            }
+
+            // Prepare next batch
+            batch.clear();
+            batch.add(new_token, n_cur as i32, &[0], true)?;
+            n_cur += 1;
+
+            // Decode
+            ctx.decode(&mut batch)?;
+        }
+
+        Ok(GenerationResult {
+            text: output_text,
+            model: DEFAULT_GENERATE_MODEL.to_string(),
+            done: true,
+        })
+    }
+
+    /// Expand a query into multiple search variations.
+    pub fn expand_query(&self, query: &str, include_lexical: bool) -> Result<Vec<Queryable>> {
+        let prompt = format!(
+            r#"/no_think Expand this search query into different forms for retrieval.
+Output format (one per line):
+lex: keyword terms for BM25 search
+vec: semantic query for vector search  
+hyde: hypothetical document that would answer the query
+
+Query: {query}
+"#
+        );
+
+        let result = self.generate(&prompt, 300)?;
+        let mut queries = parse_query_expansion(&result.text, query);
+
+        // Filter lexical if not requested
+        if !include_lexical {
+            queries.retain(|q| q.query_type != QueryType::Lex);
+        }
+
+        Ok(queries)
+    }
+}
+
+/// Reranking engine using cross-encoder models.
+pub struct RerankEngine {
+    /// Llama backend instance
+    backend: LlamaBackend,
+    /// The loaded rerank model
+    model: Arc<LlamaModel>,
+}
+
+impl std::fmt::Debug for RerankEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RerankEngine").finish()
+    }
+}
+
+/// Batch rerank result.
+#[derive(Debug, Clone)]
+pub struct BatchRerankResult {
+    /// Reranked documents
+    pub results: Vec<RerankResult>,
+    /// Model used
+    pub model: String,
+}
+
+impl RerankEngine {
+    /// Create a new rerank engine.
+    pub fn new(model_path: &Path) -> Result<Self> {
+        let backend = LlamaBackend::init()?;
+        let model_params = LlamaModelParams::default();
+
+        let model =
+            LlamaModel::load_from_file(&backend, model_path, &model_params).with_context(|| {
+                format!("Failed to load rerank model from {}", model_path.display())
+            })?;
+
+        Ok(Self {
+            backend,
+            model: Arc::new(model),
+        })
+    }
+
+    /// Load the default rerank model.
+    pub fn load_default() -> Result<Self> {
+        let model_path = get_model_path(DEFAULT_RERANK_MODEL)?;
+        Self::new(&model_path)
+    }
+
+    /// Check if rerank model exists.
+    pub fn is_available() -> bool {
+        model_exists(DEFAULT_RERANK_MODEL)
+    }
+
+    /// Rerank documents by relevance to a query using embedding similarity.
+    pub fn rerank(
+        &mut self,
+        query: &str,
+        documents: &[RerankDocument],
+    ) -> Result<BatchRerankResult> {
+        if documents.is_empty() {
+            return Ok(BatchRerankResult {
+                results: Vec::new(),
+                model: DEFAULT_RERANK_MODEL.to_string(),
+            });
+        }
+
+        // Use embedding-based scoring as a fallback approach
+        // For true cross-encoder reranking, a dedicated reranker model would be needed
+        let ctx_params = LlamaContextParams::default().with_embeddings(true);
+
+        let mut results: Vec<RerankResult> = Vec::new();
+
+        // Get query embedding
+        let query_input = format_query_for_embedding(query);
+        let query_embedding = self.get_embedding(&query_input, &ctx_params)?;
+
+        // Score each document by embedding similarity
+        for (index, doc) in documents.iter().enumerate() {
+            let doc_input = format_doc_for_embedding(&doc.text, doc.title.as_deref());
+
+            match self.get_embedding(&doc_input, &ctx_params) {
+                Ok(doc_embedding) => {
+                    let score = cosine_similarity(&query_embedding, &doc_embedding);
+                    results.push(RerankResult {
+                        file: doc.file.clone(),
+                        score,
+                        index,
+                    });
+                }
+                Err(_) => {
+                    results.push(RerankResult {
+                        file: doc.file.clone(),
+                        score: 0.0,
+                        index,
+                    });
+                }
+            }
+        }
+
+        // Sort by score descending
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(BatchRerankResult {
+            results,
+            model: DEFAULT_RERANK_MODEL.to_string(),
+        })
+    }
+
+    /// Get embedding for text.
+    fn get_embedding(&self, text: &str, ctx_params: &LlamaContextParams) -> Result<Vec<f32>> {
+        let mut ctx = self
+            .model
+            .new_context(&self.backend, ctx_params.clone())
+            .context("Failed to create context")?;
+
+        let tokens = self
+            .model
+            .str_to_token(text, AddBos::Always)
+            .context("Failed to tokenize")?;
+
+        if tokens.is_empty() {
+            bail!("Empty token sequence");
+        }
+
+        let mut batch = LlamaBatch::new(tokens.len(), 1);
+        for (i, token) in tokens.iter().enumerate() {
+            batch.add(*token, i as i32, &[0], i == tokens.len() - 1)?;
+        }
+
+        ctx.decode(&mut batch)?;
+
+        let embeddings = ctx
+            .embeddings_seq_ith(0)
+            .context("Failed to get embeddings")?;
+
+        Ok(embeddings.to_vec())
+    }
+}
+
+/// Perform hybrid search combining FTS and vector results with RRF fusion.
+pub fn hybrid_search_rrf(
+    fts_results: Vec<(String, String, String, String)>,
+    vec_results: Vec<(String, String, String, String)>,
+    k: usize,
+) -> Vec<RrfResult> {
+    reciprocal_rank_fusion(&[fts_results, vec_results], Some(&[1.0, 1.0]), k)
 }
 
 #[cfg(test)]
