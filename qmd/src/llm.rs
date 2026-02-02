@@ -1012,10 +1012,15 @@ pub struct RrfResult {
     pub best_rank: usize,
 }
 
-/// Combine multiple ranked lists using Reciprocal Rank Fusion.
+/// Combine multiple ranked lists using Reciprocal Rank Fusion with position-aware weighting.
 ///
 /// RRF score = sum(weight / (k + rank + 1)) across all lists where doc appears.
 /// k=60 is standard, provides good balance between top and lower ranks.
+///
+/// Position-aware bonuses protect top retrieval results from reranker disagreement:
+/// - Rank 1-3: 0.08 bonus (trust retrieval for exact matches)
+/// - Rank 4-10: 0.04 bonus
+/// - Rank 11+: 0.01 bonus
 ///
 /// # Arguments
 /// * `result_lists` - Vector of ranked result lists (file, `display_path`, title, body)
@@ -1056,14 +1061,18 @@ pub fn reciprocal_rank_fusion(
         }
     }
 
-    // Convert to results and add bonus for best rank
+    // Convert to results with position-aware bonuses
     let mut results: Vec<RrfResult> = scores
         .into_iter()
         .map(|(file, (score, display_path, title, body, best_rank))| {
-            // Add bonus for top-ranked documents to prevent dilution
+            // Position-aware bonus: protect top retrieval results
+            // Rank 1-3: 75% trust retrieval (highest bonus)
+            // Rank 4-10: 60% trust retrieval (medium bonus)
+            // Rank 11+: 40% trust retrieval (low bonus)
             let bonus = match best_rank {
-                0 => 0.05,     // Ranked #1 somewhere
-                1..=2 => 0.02, // Ranked top-3 somewhere
+                0..=2 => 0.08,   // Top 3: high protection
+                3..=9 => 0.04,   // Rank 4-10: medium protection
+                10..=19 => 0.01, // Rank 11-20: low protection
                 _ => 0.0,
             };
 

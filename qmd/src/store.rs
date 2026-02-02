@@ -11,6 +11,67 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Normalize path separators to forward slashes (Unix-style).
+/// This ensures consistent path handling across platforms.
+#[must_use]
+pub fn normalize_path_separators(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// Convert Git Bash style path (/c/Users/...) to Windows path (C:/Users/...).
+/// Returns the original path if not a Git Bash format.
+#[must_use]
+pub fn convert_git_bash_path(path: &str) -> String {
+    let normalized = normalize_path_separators(path);
+
+    // Check for Git Bash format: /c/... or /d/...
+    if normalized.len() >= 3
+        && normalized.starts_with('/')
+        && normalized
+            .chars()
+            .nth(1)
+            .map_or(false, |c| c.is_ascii_alphabetic())
+        && normalized.chars().nth(2) == Some('/')
+    {
+        let drive_letter = normalized.chars().nth(1).unwrap().to_ascii_uppercase();
+        return format!("{}:{}", drive_letter, &normalized[2..]);
+    }
+
+    normalized
+}
+
+/// Normalize a filesystem path for cross-platform compatibility.
+/// Handles Windows backslashes and Git Bash paths.
+#[must_use]
+pub fn normalize_filesystem_path(path: &str) -> String {
+    let converted = convert_git_bash_path(path);
+    normalize_path_separators(&converted)
+}
+
+/// Check if a path is absolute (works on both Windows and Unix).
+#[must_use]
+pub fn is_absolute_path(path: &str) -> bool {
+    let normalized = normalize_path_separators(path);
+
+    // Unix absolute path
+    if normalized.starts_with('/') {
+        return true;
+    }
+
+    // Windows absolute path (C:/ or C:\)
+    if normalized.len() >= 3 {
+        let chars: Vec<char> = normalized.chars().take(3).collect();
+        if chars[0].is_ascii_alphabetic()
+            && chars[1] == ':'
+            && (chars[2] == '/' || chars[2] == '\\')
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Document result with all metadata.
 #[derive(Debug, Clone)]
 pub struct DocumentResult {
@@ -980,6 +1041,91 @@ impl Store {
 
         Ok(files)
     }
+
+    /// Get index health information.
+    pub fn get_index_health(&self) -> Result<crate::llm::IndexHealth> {
+        // Total documents
+        let total_docs: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM documents WHERE active = 1",
+            [],
+            |row| row.get::<_, i64>(0).map(|v| v as usize),
+        )?;
+
+        // Hashes needing embedding
+        let needs_embedding: usize = self.conn.query_row(
+            r"
+                SELECT COUNT(DISTINCT d.hash)
+                FROM documents d
+                LEFT JOIN content_vectors cv ON d.hash = cv.hash
+                WHERE d.active = 1 AND cv.hash IS NULL
+                ",
+            [],
+            |row| row.get::<_, i64>(0).map(|v| v as usize),
+        )?;
+
+        // Days since last update
+        let days_stale: Option<u64> = self
+            .conn
+            .query_row(
+                "SELECT MAX(modified_at) FROM documents WHERE active = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .and_then(|ts| {
+                chrono::DateTime::parse_from_rfc3339(&ts).ok().map(|dt| {
+                    let now = chrono::Utc::now();
+                    let duration = now.signed_duration_since(dt);
+                    duration.num_days().max(0) as u64
+                })
+            });
+
+        Ok(crate::llm::IndexHealth {
+            needs_embedding,
+            total_docs,
+            days_stale,
+        })
+    }
+
+    /// Check index health and print warnings if needed.
+    pub fn check_and_warn_health(&self) {
+        if let Ok(health) = self.get_index_health()
+            && let Some(msg) = health.warning_message()
+        {
+            eprintln!("{}", colored::Colorize::yellow(msg.as_str()));
+        }
+    }
+
+    /// Get total document count.
+    pub fn get_document_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM documents WHERE active = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Get total unique hash count.
+    pub fn get_unique_hash_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT hash) FROM documents WHERE active = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Get embedded hash count.
+    pub fn get_embedded_hash_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT hash) FROM content_vectors",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
 }
 
 /// Check if a path should be excluded from indexing.
@@ -1153,89 +1299,44 @@ pub fn match_files_by_glob(store: &Store, pattern: &str) -> Result<Vec<DocumentR
     Ok(results)
 }
 
-impl Store {
-    /// Get index health information.
-    pub fn get_index_health(&self) -> Result<crate::llm::IndexHealth> {
-        // Total documents
-        let total_docs: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM documents WHERE active = 1",
-            [],
-            |row| row.get::<_, i64>(0).map(|v| v as usize),
-        )?;
+#[cfg(test)]
+mod path_tests {
+    use super::*;
 
-        // Hashes needing embedding
-        let needs_embedding: usize = self.conn.query_row(
-            r"
-                SELECT COUNT(DISTINCT d.hash)
-                FROM documents d
-                LEFT JOIN content_vectors cv ON d.hash = cv.hash
-                WHERE d.active = 1 AND cv.hash IS NULL
-                ",
-            [],
-            |row| row.get::<_, i64>(0).map(|v| v as usize),
-        )?;
-
-        // Days since last update
-        let days_stale: Option<u64> = self
-            .conn
-            .query_row(
-                "SELECT MAX(modified_at) FROM documents WHERE active = 1",
-                [],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .ok()
-            .flatten()
-            .and_then(|ts| {
-                chrono::DateTime::parse_from_rfc3339(&ts).ok().map(|dt| {
-                    let now = chrono::Utc::now();
-                    let duration = now.signed_duration_since(dt);
-                    duration.num_days().max(0) as u64
-                })
-            });
-
-        Ok(crate::llm::IndexHealth {
-            needs_embedding,
-            total_docs,
-            days_stale,
-        })
+    #[test]
+    fn test_normalize_path_separators() {
+        assert_eq!(normalize_path_separators(r"C:\Users\test"), "C:/Users/test");
+        assert_eq!(normalize_path_separators("C:/Users/test"), "C:/Users/test");
+        assert_eq!(normalize_path_separators("/home/user"), "/home/user");
     }
 
-    /// Check index health and print warnings if needed.
-    pub fn check_and_warn_health(&self) {
-        if let Ok(health) = self.get_index_health()
-            && let Some(msg) = health.warning_message()
-        {
-            eprintln!("{}", colored::Colorize::yellow(msg.as_str()));
-        }
+    #[test]
+    fn test_convert_git_bash_path() {
+        assert_eq!(convert_git_bash_path("/c/Users/test"), "C:/Users/test");
+        assert_eq!(convert_git_bash_path("/d/Projects/app"), "D:/Projects/app");
+        assert_eq!(convert_git_bash_path("/home/user"), "/home/user");
+        assert_eq!(convert_git_bash_path("C:/Users/test"), "C:/Users/test");
     }
 
-    /// Get total document count.
-    pub fn get_document_count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM documents WHERE active = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count as usize)
+    #[test]
+    fn test_normalize_filesystem_path() {
+        assert_eq!(
+            normalize_filesystem_path(r"C:\Users\test\file.md"),
+            "C:/Users/test/file.md"
+        );
+        assert_eq!(
+            normalize_filesystem_path("/c/Users/test/file.md"),
+            "C:/Users/test/file.md"
+        );
     }
 
-    /// Get total unique hash count.
-    pub fn get_unique_hash_count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT hash) FROM documents WHERE active = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count as usize)
-    }
-
-    /// Get embedded hash count.
-    pub fn get_embedded_hash_count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT hash) FROM content_vectors",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count as usize)
+    #[test]
+    fn test_is_absolute_path() {
+        assert!(is_absolute_path("/home/user"));
+        assert!(is_absolute_path("C:/Users/test"));
+        assert!(is_absolute_path(r"C:\Users\test"));
+        assert!(is_absolute_path("/c/Users/test"));
+        assert!(!is_absolute_path("relative/path"));
+        assert!(!is_absolute_path("./local"));
     }
 }

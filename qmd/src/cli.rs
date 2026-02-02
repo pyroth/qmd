@@ -238,6 +238,9 @@ pub enum Commands {
         /// Index name (creates ~/.cache/qmd/{name}.sqlite).
         name: Option<String>,
     },
+
+    /// Clean up database (alias for 'db cleanup' + 'db vacuum').
+    Cleanup,
 }
 
 /// Model management commands.

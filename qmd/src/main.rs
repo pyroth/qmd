@@ -17,7 +17,9 @@ use qmd::formatter::{
     add_line_numbers, format_bytes, format_documents, format_ls_time, format_search_results,
     format_time_ago,
 };
-use qmd::store::{Store, is_docid, is_virtual_path, parse_virtual_path, should_exclude};
+use qmd::store::{
+    Store, is_docid, is_virtual_path, match_files_by_glob, parse_virtual_path, should_exclude,
+};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -112,7 +114,52 @@ fn main() -> Result<()> {
             max_tokens,
         } => handle_ask(&question, collection.as_deref(), limit, max_tokens),
         Commands::Index { name } => handle_index(name.as_deref()),
+        Commands::Cleanup => handle_cleanup(),
     }
+}
+
+/// Handle cleanup command (combines db cleanup + vacuum).
+fn handle_cleanup() -> Result<()> {
+    let store = Store::new()?;
+
+    println!("{}\n", "Database Cleanup".bold());
+
+    // Clear LLM cache
+    let cache_cleared = store.clear_cache()?;
+    println!("{} Cleared {} cached entries", "✓".green(), cache_cleared);
+
+    // Delete inactive documents
+    let inactive = store.delete_inactive_documents()?;
+    if inactive > 0 {
+        println!("{} Removed {} inactive documents", "✓".green(), inactive);
+    }
+
+    // Cleanup orphaned content
+    let orphaned_content = store.cleanup_orphaned_content()?;
+    if orphaned_content > 0 {
+        println!(
+            "{} Removed {} orphaned content entries",
+            "✓".green(),
+            orphaned_content
+        );
+    }
+
+    // Cleanup orphaned vectors
+    let orphaned_vectors = store.cleanup_orphaned_vectors()?;
+    if orphaned_vectors > 0 {
+        println!(
+            "{} Removed {} orphaned vector entries",
+            "✓".green(),
+            orphaned_vectors
+        );
+    }
+
+    // Vacuum database
+    store.vacuum()?;
+    println!("{} Database vacuumed", "✓".green());
+
+    println!("\n{} Cleanup complete", "✓".green());
+    Ok(())
 }
 
 /// Handle collection subcommands.
@@ -580,6 +627,7 @@ fn handle_multi_get(
     let mut results: Vec<(qmd::store::DocumentResult, bool, Option<String>)> = Vec::new();
 
     if is_comma_list {
+        // Handle comma-separated list of files
         for name in pattern.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let (collection, path) = if is_virtual_path(name) {
                 if let Some(p) = parse_virtual_path(name) {
@@ -625,9 +673,39 @@ fn handle_multi_get(
             }
         }
     } else {
-        // Glob pattern - not fully implemented, just search by pattern.
-        eprintln!("Glob patterns not yet implemented. Use comma-separated list.");
-        std::process::exit(1);
+        // Glob pattern matching
+        let matched_docs = match_files_by_glob(&store, pattern)?;
+
+        if matched_docs.is_empty() {
+            eprintln!("No files matched pattern: {pattern}");
+            std::process::exit(1);
+        }
+
+        for mut doc in matched_docs {
+            if doc.body_length > max_bytes {
+                let reason = format!(
+                    "File too large ({}KB > {}KB). Use 'qmd get {}' to retrieve.",
+                    doc.body_length / 1024,
+                    max_bytes / 1024,
+                    doc.display_path
+                );
+                doc.body = None;
+                results.push((doc, true, Some(reason)));
+            } else {
+                // Fetch full document body
+                if let Ok(Some(mut full_doc)) = store.get_document(&doc.collection_name, &doc.path)
+                {
+                    // Apply line limit if specified
+                    if let Some(limit) = max_lines {
+                        if let Some(ref body) = full_doc.body {
+                            let lines: Vec<&str> = body.lines().take(limit).collect();
+                            full_doc.body = Some(lines.join("\n"));
+                        }
+                    }
+                    results.push((full_doc, false, None));
+                }
+            }
+        }
     }
 
     format_documents(&results, format);
@@ -874,6 +952,9 @@ fn handle_vsearch(
     use std::path::PathBuf;
 
     let store = Store::new()?;
+
+    // Check index health and warn if needed
+    store.check_and_warn_health();
 
     // Load embedding model
     let mut engine = if let Some(path) = model_path {
@@ -1308,6 +1389,9 @@ fn handle_qsearch(
     use qmd::llm::{EmbeddingEngine, GenerationEngine, RerankDocument, RerankEngine};
 
     let store = Store::new()?;
+
+    // Check index health and warn if needed
+    store.check_and_warn_health();
 
     // Step 1: Query expansion (optional)
     let queries = if no_expand || !GenerationEngine::is_available() {

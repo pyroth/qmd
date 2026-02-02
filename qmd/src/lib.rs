@@ -30,4 +30,7 @@ pub use llm::{
     format_doc_for_embedding, format_eta, format_query_for_embedding, hybrid_search_rrf,
     pull_model, pull_models, reciprocal_rank_fusion, render_progress_bar, resolve_model,
 };
-pub use store::{Store, find_similar_files, match_files_by_glob};
+pub use store::{
+    Store, convert_git_bash_path, find_similar_files, is_absolute_path, match_files_by_glob,
+    normalize_filesystem_path, normalize_path_separators,
+};
