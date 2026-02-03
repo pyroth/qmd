@@ -4,15 +4,16 @@ default-members = ["qmd"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.5"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/qntx/qmd"
 
 [workspace.dependencies]
-qmd = { version = "0.2.5", path = "qmd" }
+qmd = { version = "0.3.0", path = "qmd" }
 
 anyhow = "1.0"
+axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 colored = "3.0"
@@ -23,15 +24,19 @@ indicatif = "0.18.3"
 llama-cpp-2 = "0.1"
 regex = "1.11"
 reqwest = { version = "0.13.1", features = ["blocking"] }
+rmcp = { version = "0.14", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 rusqlite = { version = "0.38.0", features = ["bundled", "functions"] }
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
-zerocopy = "0.8"
+schemars = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "2.0"
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2.5"
+zerocopy = "0.8"
 
 [profile.release]
 codegen-units = 1
