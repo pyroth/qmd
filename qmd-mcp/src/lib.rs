@@ -6,16 +6,11 @@
 //! ## Features
 //!
 //! - **Tools**: search, get, status
-//! - **Transports**: stdio (local) and HTTP (remote)
 //!
 //! ## Usage
 //!
 //! ```bash
-//! # Start with stdio transport (default)
 //! qmd-mcp
-//!
-//! # Start with HTTP transport
-//! qmd-mcp --transport http --port 8080
 //! ```
 
 pub mod server;
