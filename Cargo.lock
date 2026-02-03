@@ -1408,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "qmd"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "qmd-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1447,11 +1447,13 @@ dependencies = [
 
 [[package]]
 name = "qmd-mcp"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "clap",
+ "glob",
  "qmd",
  "rmcp",
  "schemars",
@@ -1461,6 +1463,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
 ]
 
 [[package]]

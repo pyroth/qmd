@@ -157,6 +157,108 @@ pub struct QsearchParams {
     pub no_rerank: bool,
 }
 
+/// Parameters for collection_add tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CollectionAddParams {
+    /// Directory path to index (absolute path required).
+    pub path: String,
+    /// Collection name (defaults to directory name if not provided).
+    pub name: Option<String>,
+    /// Glob pattern for files (default: **/*.md).
+    #[serde(default = "default_glob_pattern")]
+    pub pattern: String,
+}
+
+/// Parameters for collection_remove tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CollectionRemoveParams {
+    /// Collection name to remove.
+    pub name: String,
+}
+
+/// Parameters for collection_rename tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CollectionRenameParams {
+    /// Current collection name.
+    pub old_name: String,
+    /// New collection name.
+    pub new_name: String,
+}
+
+/// Parameters for context_add tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ContextAddParams {
+    /// Collection name (use "*" for global context).
+    pub collection: String,
+    /// Path prefix within collection (use "/" for collection root).
+    #[serde(default = "default_root_path")]
+    pub path: String,
+    /// Context description text.
+    pub text: String,
+}
+
+/// Parameters for context_remove tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ContextRemoveParams {
+    /// Collection name (use "*" for global context).
+    pub collection: String,
+    /// Path prefix to remove context from.
+    pub path: String,
+}
+
+/// Parameters for update tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct UpdateParams {
+    /// Specific collection to update (updates all if not specified).
+    pub collection: Option<String>,
+}
+
+/// Parameters for embed tool.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+pub struct EmbedParams {
+    /// Force re-embedding of all documents.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Parameters for models_pull tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ModelsPullParams {
+    /// Model URI (e.g., "hf:user/repo/file.gguf") or "all" for default models.
+    #[serde(default = "default_model_all")]
+    pub model: String,
+    /// Force re-download even if cached.
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+/// Parameters for models_info tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ModelsInfoParams {
+    /// Model name to check (defaults to embedding model).
+    pub name: Option<String>,
+}
+
+/// Parameters for expand tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ExpandParams {
+    /// Query to expand.
+    pub query: String,
+    /// Include lexical (BM25) queries (default: true).
+    #[serde(default = "default_true")]
+    pub lexical: bool,
+}
+
+fn default_glob_pattern() -> String {
+    "**/*.md".to_string()
+}
+fn default_root_path() -> String {
+    "/".to_string()
+}
+fn default_model_all() -> String {
+    "all".to_string()
+}
+
 fn default_limit() -> usize {
     10
 }
@@ -1004,6 +1106,699 @@ impl QmdMcpServer {
 
         Ok(CallToolResult::success(vec![Content::text(summary)]))
     }
+
+    /// Add a new collection to index markdown files from a directory.
+    #[tool(name = "collection_add")]
+    async fn collection_add(
+        &self,
+        params: Parameters<CollectionAddParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            use std::path::Path;
+
+            let path = Path::new(&p.path);
+            if !path.is_absolute() {
+                return Err("Path must be absolute".to_string());
+            }
+            if !path.exists() {
+                return Err(format!("Path does not exist: {}", p.path));
+            }
+
+            let coll_name = p.name.unwrap_or_else(|| {
+                path.file_name()
+                    .map_or_else(|| "root".to_string(), |s| s.to_string_lossy().to_string())
+            });
+
+            // Check if collection exists
+            if qmd::get_collection(&coll_name)
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                return Err(format!("Collection '{}' already exists", coll_name));
+            }
+
+            // Add to config
+            qmd::add_collection(&coll_name, &p.path, &p.pattern).map_err(|e| e.to_string())?;
+
+            // Index files
+            let store = qmd::Store::new().map_err(|e| e.to_string())?;
+            let now = chrono::Utc::now().to_rfc3339();
+            let glob_matcher =
+                glob::Pattern::new(&p.pattern).map_err(|e| format!("Invalid pattern: {}", e))?;
+
+            let mut indexed = 0;
+            for entry in walkdir::WalkDir::new(&p.path)
+                .follow_links(true)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let entry_path = entry.path();
+                if !entry_path.is_file() {
+                    continue;
+                }
+                if qmd::should_exclude(entry_path) {
+                    continue;
+                }
+
+                let rel_path = entry_path
+                    .strip_prefix(&p.path)
+                    .unwrap_or(entry_path)
+                    .to_string_lossy();
+
+                if !glob_matcher.matches(&rel_path) {
+                    continue;
+                }
+
+                let Ok(content) = std::fs::read_to_string(entry_path) else {
+                    continue;
+                };
+
+                let normalized_path = qmd::Store::handelize(&rel_path);
+                let hash = qmd::Store::hash_content(&content);
+                let title = qmd::Store::extract_title(&content);
+
+                let _ = store.insert_content(&hash, &content, &now);
+                let _ =
+                    store.insert_document(&coll_name, &normalized_path, &title, &hash, &now, &now);
+                indexed += 1;
+            }
+
+            Ok(format!(
+                "Collection '{}' created with {} files indexed",
+                coll_name, indexed
+            ))
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// List all configured collections.
+    #[tool(name = "collection_list")]
+    async fn collection_list(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = tokio::task::spawn_blocking(|| -> Result<String, String> {
+            let collections = qmd::list_collections().map_err(|e| e.to_string())?;
+
+            if collections.is_empty() {
+                return Ok("No collections configured.".to_string());
+            }
+
+            let mut lines = vec!["Collections:".to_string()];
+            for coll in collections {
+                lines.push(format!(
+                    "  {} - {} (pattern: {})",
+                    coll.name, coll.path, coll.pattern
+                ));
+            }
+
+            Ok(lines.join("\n"))
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// Remove a collection and its indexed documents.
+    #[tool(name = "collection_remove")]
+    async fn collection_remove(
+        &self,
+        params: Parameters<CollectionRemoveParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            if qmd::get_collection(&p.name)
+                .map_err(|e| e.to_string())?
+                .is_none()
+            {
+                return Err(format!("Collection not found: {}", p.name));
+            }
+
+            let store = qmd::Store::new().map_err(|e| e.to_string())?;
+            let (deleted_docs, cleaned) = store
+                .remove_collection_documents(&p.name)
+                .map_err(|e| e.to_string())?;
+
+            qmd::remove_collection(&p.name).map_err(|e| e.to_string())?;
+
+            Ok(format!(
+                "Removed collection '{}': {} documents deleted, {} orphaned entries cleaned",
+                p.name, deleted_docs, cleaned
+            ))
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// Rename a collection.
+    #[tool(name = "collection_rename")]
+    async fn collection_rename(
+        &self,
+        params: Parameters<CollectionRenameParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            if qmd::get_collection(&p.old_name)
+                .map_err(|e| e.to_string())?
+                .is_none()
+            {
+                return Err(format!("Collection not found: {}", p.old_name));
+            }
+
+            if qmd::get_collection(&p.new_name)
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                return Err(format!("Collection already exists: {}", p.new_name));
+            }
+
+            let store = qmd::Store::new().map_err(|e| e.to_string())?;
+            store
+                .rename_collection_documents(&p.old_name, &p.new_name)
+                .map_err(|e| e.to_string())?;
+
+            qmd::rename_collection(&p.old_name, &p.new_name).map_err(|e| e.to_string())?;
+
+            Ok(format!(
+                "Renamed collection '{}' to '{}'",
+                p.old_name, p.new_name
+            ))
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// Add a context description for a collection or path.
+    #[tool(name = "context_add")]
+    async fn context_add(
+        &self,
+        params: Parameters<ContextAddParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            if p.collection == "*" {
+                // Global context
+                qmd::set_global_context(Some(&p.text)).map_err(|e| e.to_string())?;
+                return Ok("Set global context".to_string());
+            }
+
+            // Collection-specific context
+            if qmd::get_collection(&p.collection)
+                .map_err(|e| e.to_string())?
+                .is_none()
+            {
+                return Err(format!("Collection not found: {}", p.collection));
+            }
+
+            qmd::add_context(&p.collection, &p.path, &p.text).map_err(|e| e.to_string())?;
+
+            Ok(format!(
+                "Added context for '{}/{}': {}",
+                p.collection,
+                p.path,
+                p.text.chars().take(50).collect::<String>()
+            ))
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// List all configured contexts.
+    #[tool(name = "context_list")]
+    async fn context_list(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = tokio::task::spawn_blocking(|| -> Result<String, String> {
+            let contexts = qmd::list_all_contexts().map_err(|e| e.to_string())?;
+
+            if contexts.is_empty() {
+                return Ok("No contexts configured.".to_string());
+            }
+
+            let mut lines = vec!["Contexts:".to_string()];
+            for ctx in contexts {
+                let path_display = if ctx.path.is_empty() || ctx.path == "/" {
+                    "(root)".to_string()
+                } else {
+                    ctx.path.clone()
+                };
+                lines.push(format!(
+                    "  {}/{}: {}",
+                    ctx.collection, path_display, ctx.context
+                ));
+            }
+
+            Ok(lines.join("\n"))
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// Remove a context.
+    #[tool(name = "context_remove")]
+    async fn context_remove(
+        &self,
+        params: Parameters<ContextRemoveParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            if p.collection == "*" {
+                qmd::set_global_context(None).map_err(|e| e.to_string())?;
+                return Ok("Removed global context".to_string());
+            }
+
+            let removed = qmd::remove_context(&p.collection, &p.path).map_err(|e| e.to_string())?;
+
+            if removed {
+                Ok(format!("Removed context for '{}/{}'", p.collection, p.path))
+            } else {
+                Err(format!(
+                    "No context found for '{}/{}'",
+                    p.collection, p.path
+                ))
+            }
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// Update (re-index) collections to sync with file changes.
+    #[tool(name = "update")]
+    async fn update(
+        &self,
+        params: Parameters<UpdateParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let store = qmd::Store::new().map_err(|e| e.to_string())?;
+            let _ = store.clear_cache();
+
+            let collections = qmd::list_collections().map_err(|e| e.to_string())?;
+
+            if collections.is_empty() {
+                return Ok("No collections to update.".to_string());
+            }
+
+            let mut results = Vec::new();
+
+            for coll in collections {
+                if let Some(ref target) = p.collection {
+                    if &coll.name != target {
+                        continue;
+                    }
+                }
+
+                let now = chrono::Utc::now().to_rfc3339();
+                let glob_matcher = match glob::Pattern::new(&coll.pattern) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                let mut indexed = 0;
+                let mut updated = 0;
+                let mut seen_paths = std::collections::HashSet::new();
+
+                for entry in walkdir::WalkDir::new(&coll.path)
+                    .follow_links(true)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    let entry_path = entry.path();
+                    if !entry_path.is_file() || qmd::should_exclude(entry_path) {
+                        continue;
+                    }
+
+                    let rel_path = entry_path
+                        .strip_prefix(&coll.path)
+                        .unwrap_or(entry_path)
+                        .to_string_lossy();
+
+                    if !glob_matcher.matches(&rel_path) {
+                        continue;
+                    }
+
+                    let Ok(content) = std::fs::read_to_string(entry_path) else {
+                        continue;
+                    };
+
+                    let normalized_path = qmd::Store::handelize(&rel_path);
+                    seen_paths.insert(normalized_path.clone());
+                    let hash = qmd::Store::hash_content(&content);
+                    let title = qmd::Store::extract_title(&content);
+
+                    if let Ok(Some((doc_id, existing_hash, _))) =
+                        store.find_active_document(&coll.name, &normalized_path)
+                    {
+                        if existing_hash != hash {
+                            let _ = store.insert_content(&hash, &content, &now);
+                            let _ = store.update_document(doc_id, &title, &hash, &now);
+                            updated += 1;
+                        }
+                    } else {
+                        let _ = store.insert_content(&hash, &content, &now);
+                        let _ = store.insert_document(
+                            &coll.name,
+                            &normalized_path,
+                            &title,
+                            &hash,
+                            &now,
+                            &now,
+                        );
+                        indexed += 1;
+                    }
+                }
+
+                // Deactivate removed files
+                let mut deactivated = 0;
+                if let Ok(existing) = store.get_active_document_paths(&coll.name) {
+                    for path in existing {
+                        if !seen_paths.contains(&path) {
+                            let _ = store.deactivate_document(&coll.name, &path);
+                            deactivated += 1;
+                        }
+                    }
+                }
+
+                results.push(format!(
+                    "{}: {} new, {} updated, {} removed",
+                    coll.name, indexed, updated, deactivated
+                ));
+            }
+
+            if results.is_empty() {
+                return Ok("No matching collections found.".to_string());
+            }
+
+            Ok(format!("Update complete:\n  {}", results.join("\n  ")))
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// Generate embeddings for documents that need them.
+    #[tool(name = "embed")]
+    async fn embed(
+        &self,
+        params: Parameters<EmbedParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let store = qmd::Store::new().map_err(|e| e.to_string())?;
+
+            if p.force {
+                let cleared = store.clear_embeddings().map_err(|e| e.to_string())?;
+                if cleared > 0 {
+                    // Cleared embeddings message will be in output
+                }
+            }
+
+            let pending = store
+                .get_hashes_needing_embedding()
+                .map_err(|e| e.to_string())?;
+
+            if pending.is_empty() {
+                return Ok("All documents already have embeddings.".to_string());
+            }
+
+            let mut engine =
+                qmd::EmbeddingEngine::load_default().map_err(|e| format!("Model: {}", e))?;
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut embedded = 0;
+            let mut errors = 0;
+
+            // Get dimensions from first embedding
+            let first_content = &pending[0].2;
+            let first_title = qmd::Store::extract_title(first_content);
+            let first_text = qmd::format_doc_for_embedding(first_content, Some(&first_title));
+            let first_result = engine.embed(&first_text).map_err(|e| e.to_string())?;
+            let dims = first_result.embedding.len();
+
+            store.ensure_vector_table(dims).map_err(|e| e.to_string())?;
+
+            for (hash, _path, content) in &pending {
+                if content.is_empty() {
+                    continue;
+                }
+
+                let title = qmd::Store::extract_title(content);
+                let formatted = qmd::format_doc_for_embedding(content, Some(&title));
+
+                match engine.embed(&formatted) {
+                    Ok(result) => {
+                        if store
+                            .insert_embedding(hash, 0, 0, &result.embedding, &result.model, &now)
+                            .is_ok()
+                        {
+                            embedded += 1;
+                        }
+                    }
+                    Err(_) => {
+                        errors += 1;
+                    }
+                }
+            }
+
+            let mut msg = format!("Embedded {} documents", embedded);
+            if errors > 0 {
+                msg.push_str(&format!(", {} errors", errors));
+            }
+
+            Ok(msg)
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// List available and cached models.
+    #[tool(name = "models_list")]
+    async fn models_list(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = tokio::task::spawn_blocking(|| -> Result<String, String> {
+            let models = qmd::llm::list_cached_models();
+            let cache_dir = qmd::config::get_model_cache_dir();
+
+            let mut lines = vec![
+                "Model Cache:".to_string(),
+                format!("  Directory: {}", cache_dir.display()),
+            ];
+
+            if models.is_empty() {
+                lines.push("  No models cached.".to_string());
+            } else {
+                lines.push("  Cached models:".to_string());
+                for model in models {
+                    lines.push(format!("    - {}", model));
+                }
+            }
+
+            Ok(lines.join("\n"))
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// Get information about a specific model.
+    #[tool(name = "models_info")]
+    async fn models_info(
+        &self,
+        params: Parameters<ModelsInfoParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let model_name = p.name.as_deref().unwrap_or(qmd::llm::DEFAULT_EMBED_MODEL);
+            let cache_dir = qmd::config::get_model_cache_dir();
+            let model_path = cache_dir.join(model_name);
+
+            let mut lines = vec![
+                "Model Info:".to_string(),
+                format!("  Name: {}", model_name),
+                format!("  Path: {}", model_path.display()),
+            ];
+
+            if model_path.exists() {
+                let size = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+                lines.push(format!("  Status: Downloaded ({} MB)", size / 1024 / 1024));
+            } else {
+                lines.push("  Status: Not downloaded".to_string());
+            }
+
+            Ok(lines.join("\n"))
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// Download models from HuggingFace.
+    #[tool(name = "models_pull")]
+    async fn models_pull(
+        &self,
+        params: Parameters<ModelsPullParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let results = if p.model == "all" {
+                let default_models = [
+                    qmd::llm::DEFAULT_EMBED_MODEL_URI,
+                    qmd::llm::DEFAULT_RERANK_MODEL_URI,
+                ];
+                qmd::pull_models(&default_models, p.refresh).map_err(|e| e.to_string())?
+            } else {
+                vec![qmd::pull_model(&p.model, p.refresh).map_err(|e| e.to_string())?]
+            };
+
+            let mut lines = vec!["Models:".to_string()];
+            for result in &results {
+                let status = if result.refreshed {
+                    "Downloaded"
+                } else {
+                    "Cached"
+                };
+                let name = result
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                lines.push(format!(
+                    "  {} {} ({} MB)",
+                    status,
+                    name,
+                    result.size_bytes / 1024 / 1024
+                ));
+            }
+            lines.push(format!("{} model(s) ready", results.len()));
+
+            Ok(lines.join("\n"))
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// Clean up the database: remove orphaned entries and vacuum.
+    #[tool(name = "db_cleanup")]
+    async fn db_cleanup(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = tokio::task::spawn_blocking(|| -> Result<String, String> {
+            let store = qmd::Store::new().map_err(|e| e.to_string())?;
+
+            let cache_cleared = store.clear_cache().map_err(|e| e.to_string())?;
+            let inactive = store
+                .delete_inactive_documents()
+                .map_err(|e| e.to_string())?;
+            let orphaned_content = store
+                .cleanup_orphaned_content()
+                .map_err(|e| e.to_string())?;
+            let orphaned_vectors = store
+                .cleanup_orphaned_vectors()
+                .map_err(|e| e.to_string())?;
+            store.vacuum().map_err(|e| e.to_string())?;
+
+            Ok(format!(
+                "Cleanup complete:\n  {} cache entries cleared\n  {} inactive documents removed\n  {} orphaned content entries removed\n  {} orphaned vectors removed\n  Database vacuumed",
+                cache_cleared, inactive, orphaned_content, orphaned_vectors
+            ))
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// Vacuum the database to reclaim space.
+    #[tool(name = "db_vacuum")]
+    async fn db_vacuum(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = tokio::task::spawn_blocking(|| -> Result<String, String> {
+            let store = qmd::Store::new().map_err(|e| e.to_string())?;
+            store.vacuum().map_err(|e| e.to_string())?;
+            Ok("Database vacuumed successfully".to_string())
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    /// Expand a query into multiple search queries using LLM.
+    #[tool(name = "expand")]
+    async fn expand(
+        &self,
+        params: Parameters<ExpandParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let p = params.0;
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let queries = if qmd::GenerationEngine::is_available() {
+                match qmd::GenerationEngine::load_default() {
+                    Ok(engine) => match engine.expand_query(&p.query, p.lexical) {
+                        Ok(q) => q,
+                        Err(_) => qmd::expand_query_simple(&p.query),
+                    },
+                    Err(_) => qmd::expand_query_simple(&p.query),
+                }
+            } else {
+                qmd::expand_query_simple(&p.query)
+            };
+
+            let mut lines = vec![format!("Original: {}", p.query), "Expanded:".to_string()];
+
+            for q in &queries {
+                let type_str = match q.query_type {
+                    qmd::QueryType::Lex => "lex",
+                    qmd::QueryType::Vec => "vec",
+                    qmd::QueryType::Hyde => "hyde",
+                };
+                lines.push(format!("  [{}] {}", type_str, q.text));
+            }
+
+            Ok(lines.join("\n"))
+        })
+        .await
+        .map_err(|e| to_mcp_error(e))?
+        .map_err(|e| to_mcp_error(e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
 }
 
 /// Format file size in human-readable form.
@@ -1032,9 +1827,10 @@ impl ServerHandler for QmdMcpServer {
             },
             instructions: Some(
                 "QMD - Quick Markdown Search. A local search engine for markdown knowledge bases. \
-                 Tools: 'search' (BM25), 'vsearch' (semantic), 'query'/'qsearch' (hybrid), \
-                 'ask' (RAG Q&A), 'rerank' (cross-encoder), \
-                 'get'/'multi_get' (retrieve), 'ls' (browse), 'status' (health)."
+                 Search: 'search' (BM25), 'vsearch' (semantic), 'query'/'qsearch' (hybrid), 'expand'. \
+                 AI: 'ask' (RAG Q&A), 'rerank' (cross-encoder). \
+                 Docs: 'get'/'multi_get', 'ls', 'status'. \
+                 Admin: 'collection_*', 'context_*', 'update', 'embed', 'models_*', 'db_*'."
                     .into(),
             ),
         }
